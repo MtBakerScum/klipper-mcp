@@ -140,3 +140,15 @@ async def test_send_gcode_and_firmware_restart_and_emergency_stop(monkeypatch):
     assert (await srv.firmware_restart(confirm=True))["ok"] and fr.called
     # emergency_stop acts immediately, no confirm parameter
     assert (await srv.emergency_stop())["ok"] and es.called
+
+
+@respx.mock
+async def test_set_temperature_accepts_toolchanger_extruders(monkeypatch):
+    _env(monkeypatch); _mock_reads()
+    script = respx.post(url__regex=rf"{B}/printer/gcode/script.*").mock(return_value=httpx.Response(200, json={"result": "ok"}))
+    out = await srv.set_temperature("extruder3", 250)
+    assert out["confirm_required"] is True
+    assert out["preview"]["gcode"] == "SET_HEATER_TEMPERATURE HEATER=extruder3 TARGET=250"
+    assert not script.called
+    out = await srv.set_temperature("extruder2", 320, confirm=True)
+    assert "refused" in out["error"] and not script.called

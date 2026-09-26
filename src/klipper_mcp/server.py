@@ -47,7 +47,8 @@ def summarize_job(job: dict) -> dict:
 @mcp.tool()
 async def get_printer_status() -> dict:
     """Live printer state in one call: Klipper state (ready/shutdown/error + message), current job
-    (state, file, progress, durations), extruder and bed actual/target temps, fan, pressure advance,
+    (state, file, progress, durations), the active extruder, actual/target temps for every extruder
+    (extruder, extruder1..3 on toolchangers) and the bed, fan, pressure advance of the active tool,
     live Z offset, speed/flow factors, toolhead position. Read-only. Use this before any control."""
     try:
         async with _client() as c:
@@ -96,7 +97,8 @@ async def list_gcode_files(limit: int = 50) -> dict:
         return _err(e)
 
 
-_HEATERS = {"extruder": "extruder", "bed": "heater_bed", "heater_bed": "heater_bed"}
+_HEATERS = {"extruder": "extruder", "extruder1": "extruder1", "extruder2": "extruder2",
+            "extruder3": "extruder3", "bed": "heater_bed", "heater_bed": "heater_bed"}
 _GCODE_SUFFIXES = {".gcode", ".gco", ".g", ".ufp"}
 
 
@@ -114,18 +116,20 @@ def _job_preview(st: dict) -> dict:
 
 @mcp.tool()
 async def set_temperature(heater: str, target: float, confirm: bool = False) -> dict:
-    """Set a heater target. heater: 'extruder' or 'bed'. Hard ceilings: extruder 300C, bed 110C.
+    """Set a heater target. heater: 'extruder' (tool 1), 'extruder1'..'extruder3' (tools 2-4 on a
+    toolchanger), or 'bed'. Hard ceilings: any extruder 300C, bed 110C.
     Refused unless Klipper is ready. TWO-PHASE: without confirm=true this returns a preview and
     changes nothing; ask the user, then call again with confirm=true."""
     try:
         h = _HEATERS.get(heater)
         if not h:
-            return {"error": f"unknown heater '{heater}' (use 'extruder' or 'bed')"}
-        gate.check_bounds(**({"extruder_c": target} if h == "extruder" else {"bed_c": target}))
+            return {"error": f"unknown heater '{heater}' (use 'extruder', 'extruder1'..'extruder3' or 'bed')"}
+        is_ex = h.startswith("extruder")
+        gate.check_bounds(**({"extruder_c": target} if is_ex else {"bed_c": target}))
         gcode = f"SET_HEATER_TEMPERATURE HEATER={h} TARGET={float(target):g}"
         async with _client() as c:
             _, st = await _ready_and_status(c)
-            cur = st["temps"]["extruder" if h == "extruder" else "bed"]["actual"]
+            cur = (st["temps"].get(h) or {}).get("actual") if is_ex else st["temps"]["bed"]["actual"]
             if not confirm:
                 return gate.confirm_required("set_temperature", {"heater": h, "target_c": target,
                                                                  "current_c": cur, "gcode": gcode})

@@ -40,3 +40,23 @@ def test_missing_objects_do_not_crash():
 
 def test_status_objects_include_webhooks():
     assert "webhooks" in STATUS_OBJECTS and "print_stats" in STATUS_OBJECTS
+
+
+def test_toolchanger_reports_every_tool_and_the_active_one():
+    raw = dict(RAW)
+    raw["extruder"] = {"temperature": 36.0, "target": 0.0, "pressure_advance": 0.033}
+    raw["extruder1"] = {"temperature": 30.0, "target": 0.0, "pressure_advance": 0.02}
+    raw["extruder3"] = {"temperature": 255.2, "target": 255.0, "pressure_advance": 0.04}
+    raw["toolhead"] = {"homed_axes": "xyz", "position": [1.0, 2.0, 3.0, 0.0], "extruder": "extruder3"}
+    s = summarize_status(raw)
+    assert s["active_extruder"] == "extruder3"
+    assert s["temps"]["extruder3"] == {"actual": 255.2, "target": 255.0}
+    assert s["temps"]["extruder"]["actual"] == 36.0
+    assert "extruder2" not in s["temps"]
+    assert s["pressure_advance"] == 0.04
+    assert s["pressure_advance_by_extruder"] == {"extruder": 0.033, "extruder1": 0.02, "extruder3": 0.04}
+
+
+def test_status_objects_include_all_toolchanger_extruders():
+    for n in ("extruder", "extruder1", "extruder2", "extruder3"):
+        assert n in STATUS_OBJECTS
