@@ -18,5 +18,6 @@ def test_every_tool_has_title_and_hints():
 
 def test_read_tools_are_read_only():
     tools = {t.name: t for t in anyio.run(srv.mcp.list_tools)}
-    for n in ("get_printer_status", "get_printer_info", "list_print_history", "list_gcode_files"):
+    for n in ("get_printer_status", "get_printer_info", "list_print_history", "list_gcode_files",
+              "get_console", "get_power_devices", "get_bed_mesh"):
         assert tools[n].annotations.read_only_hint is True, n

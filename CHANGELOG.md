@@ -9,6 +9,7 @@
 - The capture systemd unit is sandboxed (ProtectSystem=strict, ProtectHome=read-only with the store directory writable, NoNewPrivileges, empty capability set, `@system-service` syscall filter).
 ### Added
 - Read tools: get_printer_status, get_printer_info, list_print_history, list_gcode_files.
+- Read tools: get_console (recent console lines, temp reports filtered, optional regex), get_power_devices, get_bed_mesh (grid plus range, tilt and corner summary).
 - Two-phase gated control: set_temperature, pause/resume/cancel_print, tune_live, send_gcode, firmware_restart; emergency_stop acts immediately.
 - start_print uploads a local gcode to the printer and starts it, after confirmation.
 - klipper-mcp-capture service records every finished print into the shared outcome store and backfills from history on reconnect.

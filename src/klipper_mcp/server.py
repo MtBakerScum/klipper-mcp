@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+import re
 import importlib.metadata
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
@@ -93,6 +94,87 @@ async def list_gcode_files(limit: int = 50) -> dict:
         return {"count": len(shown), "total": len(files),
                 "files": [{"path": f.get("path"), "size": f.get("size"), "modified": f.get("modified")}
                           for f in shown]}
+    except ApiError as e:
+        return _err(e)
+
+
+_TEMP_LINE = re.compile(r"^\s*(ok\s+)?(B|T\d?):\s*-?\d", re.I)
+
+
+@mcp.tool()
+async def get_console(count: int = 50, pattern: str | None = None, include_temps: bool = False) -> dict:
+    """Recent Klipper console lines (what Fluidd/Mainsail show in the console): commands sent and
+    responses/errors, oldest first. count = lines to return after filtering (1..500). pattern = optional
+    case-insensitive regex to keep only matching lines. Temperature report lines are dropped unless
+    include_temps=true. Read-only."""
+    try:
+        count = max(1, min(count, 500))
+        rx = re.compile(pattern, re.I) if pattern else None
+        async with _client() as c:
+            store = await c.gcode_store(count=1000)
+        lines = []
+        for e in store:
+            msg = (e.get("message") or "").strip()
+            if not include_temps and _TEMP_LINE.match(msg):
+                continue
+            if rx and not rx.search(msg):
+                continue
+            lines.append({"time": e.get("time"), "type": e.get("type"), "message": msg})
+        lines = lines[-count:]
+        return {"count": len(lines), "lines": lines}
+    except re.error as e:
+        return {"error": f"bad_pattern: {e}"}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def get_power_devices() -> dict:
+    """Moonraker power devices (e.g. exhaust fan / lights / smart plugs set up under [power]) and
+    their on/off state. Read-only."""
+    try:
+        async with _client() as c:
+            devs = await c.power_devices()
+        return {"count": len(devs), "devices": [
+            {"device": d.get("device"), "status": d.get("status"), "type": d.get("type"),
+             "locked_while_printing": d.get("locked_while_printing")} for d in devs]}
+    except ApiError as e:
+        return _err(e)
+
+
+def summarize_mesh(bm: dict) -> dict:
+    m = bm.get("probed_matrix") or []
+    vals = [v for row in m for v in row]
+    if not vals:
+        return {"profile": bm.get("profile_name") or None, "loaded": False,
+                "profiles": sorted((bm.get("profiles") or {}).keys())}
+    rows, cols = len(m), len(m[0])
+    mean = lambda xs: sum(xs) / len(xs)
+    r = lambda x: round(x, 4)
+    return {
+        "profile": bm.get("profile_name"), "loaded": True,
+        "profiles": sorted((bm.get("profiles") or {}).keys()),
+        "mesh_min": bm.get("mesh_min"), "mesh_max": bm.get("mesh_max"),
+        "points": f"{cols}x{rows}",
+        "min": r(min(vals)), "max": r(max(vals)), "range": r(max(vals) - min(vals)), "mean": r(mean(vals)),
+        # row 0 is the front (min Y), column 0 is the left (min X)
+        "front_mean": r(mean(m[0])), "back_mean": r(mean(m[-1])),
+        "left_mean": r(mean([row[0] for row in m])), "right_mean": r(mean([row[-1] for row in m])),
+        "corners": {"front_left": r(m[0][0]), "front_right": r(m[0][-1]),
+                    "back_left": r(m[-1][0]), "back_right": r(m[-1][-1])},
+        "probed_matrix": [[r(v) for v in row] for row in m],
+    }
+
+
+@mcp.tool()
+async def get_bed_mesh() -> dict:
+    """The active bed mesh: profile, probed grid, min/max/range/mean, front/back/left/right averages
+    and corner heights (to spot tilt), plus saved profile names. Row 0 = front, column 0 = left.
+    Read-only."""
+    try:
+        async with _client() as c:
+            st = await c.objects_query(["bed_mesh"])
+        return summarize_mesh(st.get("bed_mesh") or {})
     except ApiError as e:
         return _err(e)
 
@@ -318,6 +400,9 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "get_printer_info": ("Get Klipper host info", True, False),
     "list_print_history": ("List print history", True, False),
     "list_gcode_files": ("List G-code files on printer", True, False),
+    "get_console": ("Get recent console lines", True, False),
+    "get_power_devices": ("Get power device states", True, False),
+    "get_bed_mesh": ("Get bed mesh", True, False),
     "set_temperature": ("Set heater temperature", False, True),
     "pause_print": ("Pause print", False, True),
     "resume_print": ("Resume print", False, True),

@@ -117,3 +117,12 @@ class MoonrakerClient:
 
     async def firmware_restart(self) -> str:
         return await self._request("POST", "/printer/firmware_restart")
+
+    # --- read-only extras ---
+    async def power_devices(self) -> list[dict]:
+        res = await self._request("GET", "/machine/device_power/devices")
+        return (res or {}).get("devices", [])
+
+    async def gcode_store(self, count: int = 100) -> list[dict]:
+        res = await self._request("GET", "/server/gcode_store", params={"count": count})
+        return (res or {}).get("gcode_store", [])
