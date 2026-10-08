@@ -28,6 +28,18 @@ async def test_get_console_drops_temps_and_filters(monkeypatch):
 
 
 @respx.mock
+async def test_get_console_drops_duplicate_entries(monkeypatch):
+    _env(monkeypatch)
+    dup = {"message": "SET_PRINT_PREFERENCES BED_LEVEL=0", "time": 5.0, "type": "command"}
+    respx.get(url__regex=rf"{B}/server/gcode_store.*").mock(return_value=httpx.Response(200, json={
+        "result": {"gcode_store": [dup, dup, dup, {"message": "G28", "time": 6.0, "type": "command"},
+                                   {"message": "G28", "time": 7.0, "type": "command"}]}}))
+    out = await srv.get_console()
+    assert [(l["time"], l["message"]) for l in out["lines"]] == [
+        (5.0, "SET_PRINT_PREFERENCES BED_LEVEL=0"), (6.0, "G28"), (7.0, "G28")]
+
+
+@respx.mock
 async def test_get_power_devices(monkeypatch):
     _env(monkeypatch)
     respx.get(f"{B}/machine/device_power/devices").mock(return_value=httpx.Response(200, json={

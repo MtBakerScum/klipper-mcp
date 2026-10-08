@@ -14,6 +14,7 @@ def _env(m):
     respx.get(url__regex=rf"{B}/printer/objects/query.*").mock(return_value=httpx.Response(200, json=IDLE))
     respx.get(url__regex=rf"{B}/server/files/list.*").mock(return_value=httpx.Response(
         200, json={"result": [{"path": "onpi.gcode", "modified": 1.0, "size": 5}]}))
+    respx.post(url__regex=rf"{B}/printer/gcode/script.*").mock(return_value=httpx.Response(200, json={"result": "ok"}))
 
 
 @respx.mock
@@ -128,3 +129,30 @@ async def test_start_print_refuses_while_paused(monkeypatch, tmp_path):
         assert out["error"] == "printer_busy"
         assert out["current"] == {"filename": "running.gcode", "job_state": "paused", "progress_percent": 42}
     assert not start.called
+
+
+@respx.mock
+async def test_start_print_sends_snapmaker_preferences_before_start(monkeypatch):
+    _env(monkeypatch)
+    order = []
+    respx.post(url__regex=rf"{B}/printer/gcode/script.*").mock(
+        side_effect=lambda req: order.append(("script", req.url.params["script"])) or httpx.Response(200, json={"result": "ok"}))
+    respx.post(url__regex=rf"{B}/printer/print/start.*").mock(
+        side_effect=lambda req: order.append(("start", None)) or httpx.Response(200, json={"result": "ok"}))
+    prev = await srv.start_print("onpi.gcode")
+    assert prev["preview"]["print_preferences"] == {"bed_level": True, "flow_calibrate": False, "timelapse": False}
+    assert order == []
+    out = await srv.start_print("onpi.gcode", confirm=True, timelapse=True)
+    assert out["ok"] and out["print_preferences_applied"] is True
+    assert order == [("script", "SET_PRINT_PREFERENCES BED_LEVEL=1 FLOW_CALIBRATE=0 TIME_LAPSE_CAMERA=1"),
+                     ("start", None)]
+
+
+@respx.mock
+async def test_start_print_still_starts_when_preferences_unknown(monkeypatch):
+    _env(monkeypatch)
+    respx.post(url__regex=rf"{B}/printer/gcode/script.*").mock(return_value=httpx.Response(
+        400, json={"error": {"code": 400, "message": "Unknown command:\"SET_PRINT_PREFERENCES\""}}))
+    start = respx.post(url__regex=rf"{B}/printer/print/start.*").mock(return_value=httpx.Response(200, json={"result": "ok"}))
+    out = await srv.start_print("onpi.gcode", confirm=True, bed_level=False)
+    assert out["ok"] and out["print_preferences_applied"] is False and start.called

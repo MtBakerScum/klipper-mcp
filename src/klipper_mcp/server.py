@@ -112,9 +112,14 @@ async def get_console(count: int = 50, pattern: str | None = None, include_temps
         rx = re.compile(pattern, re.I) if pattern else None
         async with _client() as c:
             store = await c.gcode_store(count=1000)
-        lines = []
+        lines, seen = [], set()
         for e in store:
             msg = (e.get("message") or "").strip()
+            # Moonraker can store the same entry several times (same time/type/message); keep one.
+            key = (e.get("time"), e.get("type"), msg)
+            if key in seen:
+                continue
+            seen.add(key)
             if not include_temps and _TEMP_LINE.match(msg):
                 continue
             if rx and not rx.search(msg):
@@ -340,15 +345,32 @@ async def emergency_stop() -> dict:
         return _err(e)
 
 
+async def _apply_print_preferences(c, bed_level: bool, flow_calibrate: bool, timelapse: bool) -> bool:
+    """Snapmaker firmware reads these before PRINT_START. Returns False (and starts anyway) when the
+    printer does not know SET_PRINT_PREFERENCES, i.e. it is not a Snapmaker U1."""
+    b = lambda v: 1 if v else 0
+    try:
+        await c.gcode_script(f"SET_PRINT_PREFERENCES BED_LEVEL={b(bed_level)} "
+                             f"FLOW_CALIBRATE={b(flow_calibrate)} TIME_LAPSE_CAMERA={b(timelapse)}")
+        return True
+    except ApiError:
+        return False
+
+
 @mcp.tool()
-async def start_print(path: str, confirm: bool = False) -> dict:
+async def start_print(path: str, confirm: bool = False, bed_level: bool = True,
+                      flow_calibrate: bool = False, timelapse: bool = False) -> dict:
     """Start a print. path = a LOCAL gcode file on this server (e.g. one saved by orcaslicer-mcp's
     save_gcode; it is uploaded to the printer under its basename) OR a filename already staged on
     the printer, including in a subdirectory (see list_gcode_files; no upload). A bare name that
     also exists as a local file in this server's working directory is treated as local and
     uploaded; the preview's upload_needed / overwrites_existing fields show which. TWO-PHASE:
     without confirm=true this returns a preview and changes nothing; ask the user, then call
-    again with confirm=true. Refused unless Klipper is ready and idle."""
+    again with confirm=true. Refused unless Klipper is ready and idle.
+    Snapmaker U1 print preferences (sent as SET_PRINT_PREFERENCES before starting, the same way
+    Snapmaker Orca does): bed_level (default true; without it the start G-code skips the bed mesh
+    and reuses the last saved one), flow_calibrate (default false), timelapse (default false).
+    On printers without that command the preferences are skipped and the print still starts."""
     try:
         local = Path(path)
         is_local = local.exists() and local.is_file()
@@ -369,9 +391,12 @@ async def start_print(path: str, confirm: bool = False) -> dict:
             preview = {"filename": filename, "upload_needed": is_local,
                        "overwrites_existing": overwrites_existing,
                        "size_bytes": local.stat().st_size if is_local else None,
-                       "klippy_state": st["klippy"]["state"], "job_state": st["job"]["state"]}
+                       "klippy_state": st["klippy"]["state"], "job_state": st["job"]["state"],
+                       "print_preferences": {"bed_level": bed_level, "flow_calibrate": flow_calibrate,
+                                             "timelapse": timelapse}}
             if not confirm:
                 return gate.confirm_required("start_print", preview)
+            prefs_applied = await _apply_print_preferences(c, bed_level, flow_calibrate, timelapse)
             if is_local:
                 await c.upload_gcode(str(local), filename)
                 try:
@@ -381,7 +406,7 @@ async def start_print(path: str, confirm: bool = False) -> dict:
             else:
                 await c.print_start(filename)
         return {"ok": True, "action": "start_print", "filename": filename, "uploaded": is_local,
-                "overwrites_existing": overwrites_existing}
+                "overwrites_existing": overwrites_existing, "print_preferences_applied": prefs_applied}
     except (PrinterNotReady, ApiError) as e:
         return _err(e)
 
