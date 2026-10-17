@@ -71,3 +71,40 @@ async def test_get_bed_mesh_none_loaded(monkeypatch):
         "result": {"status": {"bed_mesh": {"profile_name": "", "probed_matrix": [[]], "profiles": {}}}}}))
     out = await srv.get_bed_mesh()
     assert out["loaded"] is False
+
+
+JPEG = b"\xff\xd8\xff\xe0fakejpeg"
+
+
+@respx.mock
+async def test_get_camera_snapshot_uses_moonraker_webcam_list(monkeypatch):
+    _env(monkeypatch)
+    respx.get(f"{B}/server/webcams/list").mock(return_value=httpx.Response(200, json={
+        "result": {"webcams": [{"name": "U1 Camera", "snapshot_url": "/webcam/?action=snapshot"}]}}))
+    snap = respx.get("http://x/webcam/?action=snapshot").mock(
+        return_value=httpx.Response(200, content=JPEG, headers={"content-type": "image/jpeg"}))
+    out = await srv.get_camera_snapshot()
+    assert snap.called
+    img, meta = out
+    assert img.data == JPEG and img._mime_type == "image/jpeg"
+    assert meta["camera"] == "U1 Camera" and meta["bytes"] == len(JPEG)
+
+
+@respx.mock
+async def test_get_camera_snapshot_falls_back_and_reports(monkeypatch):
+    _env(monkeypatch)
+    respx.get(f"{B}/server/webcams/list").mock(return_value=httpx.Response(200, json={"result": {"webcams": []}}))
+    respx.get("http://x/webcam/?action=snapshot").mock(return_value=httpx.Response(404))
+    respx.get("http://x/webcam/snapshot.jpg").mock(
+        return_value=httpx.Response(200, content=JPEG, headers={"content-type": "image/jpeg"}))
+    img, meta = await srv.get_camera_snapshot()
+    assert meta["url"] == "http://x/webcam/snapshot.jpg"
+
+
+@respx.mock
+async def test_get_camera_snapshot_unknown_camera(monkeypatch):
+    _env(monkeypatch)
+    respx.get(f"{B}/server/webcams/list").mock(return_value=httpx.Response(200, json={
+        "result": {"webcams": [{"name": "U1 Camera", "snapshot_url": "/webcam/?action=snapshot"}]}}))
+    out = await srv.get_camera_snapshot("nozzle cam")
+    assert "no camera" in out["error"] and out["cameras"] == ["U1 Camera"]

@@ -2,7 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import importlib.metadata
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import MCPServer, Image
 from mcp.types import ToolAnnotations
 from .config import load_config
 from .client import MoonrakerClient
@@ -143,6 +143,57 @@ async def get_power_devices() -> dict:
         return {"count": len(devs), "devices": [
             {"device": d.get("device"), "status": d.get("status"), "type": d.get("type"),
              "locked_while_printing": d.get("locked_while_printing")} for d in devs]}
+    except ApiError as e:
+        return _err(e)
+
+
+# Tried when Moonraker has no webcam configured (paths seen on crowsnest / paxx firmware).
+_SNAPSHOT_FALLBACKS = ("/webcam/?action=snapshot", "/webcam/snapshot.jpg", "/webcam/snapshot")
+
+
+@mcp.tool()
+async def get_camera_snapshot(camera: str | None = None):
+    """Take a still picture from the printer's camera and look at it: check the first layer,
+    spaghetti, a lifted corner, whether the plate is clear before a print, or progress. Uses the
+    cameras configured in Moonraker (the ones Fluidd shows); pass camera= to pick one by name,
+    default the first. Returns the image plus which camera and URL it came from. Read-only; it
+    doesn't move or light anything (turn the chamber light on first if the picture is dark)."""
+    try:
+        async with _client() as c:
+            cams = []
+            try:
+                cams = await c.webcams()
+            except ApiError:
+                pass  # older Moonraker without the webcam list: fall back to the usual paths
+            root = c.web_root()
+            if camera is not None:
+                pick = [w for w in cams if (w.get("name") or "").lower() == camera.lower()]
+                if not pick:
+                    return {"error": f"no camera named {camera!r}",
+                            "cameras": [w.get("name") for w in cams]}
+                cams = pick
+            urls: list[tuple[str, str]] = []
+            for w in cams:
+                u = (w.get("snapshot_url") or "").strip()
+                if u:
+                    urls.append((w.get("name") or "camera", u if "://" in u else root + "/" + u.lstrip("/")))
+            if camera is None:
+                urls += [("default", root + p) for p in _SNAPSHOT_FALLBACKS]
+            tried = []
+            for name, url in urls:
+                try:
+                    data, ctype = await c.get_bytes(url)
+                except ApiError as e:
+                    tried.append(f"{url}: {e}")
+                    continue
+                if not ctype.startswith("image/") or not data:
+                    tried.append(f"{url}: not an image ({ctype or 'no content type'})")
+                    continue
+                fmt = ctype.split("/", 1)[1].split(";", 1)[0].strip() or "jpeg"
+                return [Image(data=data, format=fmt),
+                        {"camera": name, "url": url, "bytes": len(data),
+                         "cameras": [w.get("name") for w in cams]}]
+            return {"error": "no snapshot available", "tried": tried}
     except ApiError as e:
         return _err(e)
 
@@ -428,6 +479,7 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "get_console": ("Get recent console lines", True, False),
     "get_power_devices": ("Get power device states", True, False),
     "get_bed_mesh": ("Get bed mesh", True, False),
+    "get_camera_snapshot": ("Take a camera snapshot", True, False),
     "set_temperature": ("Set heater temperature", False, True),
     "pause_print": ("Pause print", False, True),
     "resume_print": ("Resume print", False, True),

@@ -123,6 +123,26 @@ class MoonrakerClient:
         res = await self._request("GET", "/machine/device_power/devices")
         return (res or {}).get("devices", [])
 
+    async def webcams(self) -> list[dict]:
+        res = await self._request("GET", "/server/webcams/list")
+        return (res or {}).get("webcams", [])
+
+    def web_root(self) -> str:
+        """The printer's web front end (Fluidd/nginx on port 80): Moonraker's URL without its port.
+        Webcam snapshot URLs in Moonraker's list are relative to this."""
+        u = httpx.URL(self._base)
+        return f"{u.scheme}://{u.host}"
+
+    async def get_bytes(self, url: str) -> tuple[bytes, str]:
+        """GET an absolute URL; returns (body, content-type). Raises NotReachable / ApiError."""
+        try:
+            resp = await self._http.get(url)
+        except httpx.TransportError as e:
+            raise NotReachable(f"{url} not reachable: {e}") from e
+        if resp.status_code >= 400:
+            raise error_from_status(resp.status_code, {})
+        return resp.content, resp.headers.get("content-type", "")
+
     async def gcode_store(self, count: int = 100) -> list[dict]:
         res = await self._request("GET", "/server/gcode_store", params={"count": count})
         return (res or {}).get("gcode_store", [])

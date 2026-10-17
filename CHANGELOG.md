@@ -10,6 +10,7 @@
 - `get_console` drops duplicate entries (same time, type and message) that Moonraker can store several times.
 - The capture systemd unit is sandboxed (ProtectSystem=strict, ProtectHome=read-only with the store directory writable, NoNewPrivileges, empty capability set, `@system-service` syscall filter).
 ### Added
+- get_camera_snapshot: a still from the printer camera as an image (cameras from Moonraker's webcam list, pick one by name; falls back to the usual /webcam snapshot paths). Read-only.
 - Read tools: get_printer_status, get_printer_info, list_print_history, list_gcode_files.
 - Read tools: get_console (recent console lines, temp reports filtered, optional regex), get_power_devices, get_bed_mesh (grid plus range, tilt and corner summary).
 - Two-phase gated control: set_temperature, pause/resume/cancel_print, tune_live, send_gcode, firmware_restart; emergency_stop acts immediately.
