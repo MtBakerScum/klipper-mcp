@@ -86,6 +86,17 @@ class MoonrakerClient:
         res = await self._request("GET", f"/printer/objects/query?{params}")
         return (res or {}).get("status", {})
 
+    async def objects_list(self) -> list[str]:
+        res = await self._request("GET", "/printer/objects/list")
+        return (res or {}).get("objects", [])
+
+    async def objects_query_named(self, objects: list[str]) -> dict:
+        """Like objects_query, but URL-encodes each name, so 'temperature_sensor cavity' works."""
+        from urllib.parse import quote
+        params = "&".join(quote(o, safe="") for o in objects)
+        res = await self._request("GET", f"/printer/objects/query?{params}")
+        return (res or {}).get("status", {})
+
     async def history_list(self, limit: int = 20, since: float | None = None) -> list[dict]:
         params = {"limit": limit, "order": "desc"}
         if since is not None:
@@ -136,6 +147,35 @@ class MoonrakerClient:
 
     async def firmware_restart(self) -> str:
         return await self._request("POST", "/printer/firmware_restart")
+
+    # --- config files (root "config") ---
+    async def config_files(self) -> list[dict]:
+        return await self._request("GET", "/server/files/list", params={"root": "config"}) or []
+
+    async def config_read(self, path: str) -> str:
+        from urllib.parse import quote
+        try:
+            resp = await self._http.get(f"{self._base}/server/files/config/{quote(path)}")
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            raise NotReachable(f"Moonraker not reachable at {self._base}: {e}") from e
+        except httpx.TransportError as e:
+            raise NoReply(f"no reply reading {path}: {type(e).__name__}") from e
+        if resp.status_code >= 400:
+            raise error_from_status(resp.status_code, {})
+        return resp.text
+
+    async def config_copy(self, src: str, dest: str) -> dict:
+        return await self._request("POST", "/server/files/copy",
+                                   data={"source": f"config/{src}", "dest": f"config/{dest}"})
+
+    async def config_write(self, path: str, text: str) -> dict:
+        from pathlib import PurePosixPath
+        p = PurePosixPath(path)
+        data = {"root": "config"}
+        if str(p.parent) not in ("", "."):
+            data["path"] = str(p.parent)
+        return await self._request("POST", "/server/files/upload",
+                                   files={"file": (p.name, text.encode("utf-8"), "text/plain")}, data=data)
 
     # --- read-only extras ---
     async def power_devices(self) -> list[dict]:

@@ -59,6 +59,109 @@ async def get_printer_status() -> dict:
 
 
 @mcp.tool()
+async def get_printer_sensors() -> dict:
+    """Every sensor, fan and output the printer reports, in one call: heaters (temp, target, power %
+    for each extruder, the bed and any heater_generic such as a chamber heater), temperature sensors
+    (chamber/cavity, MCU, host...), stepper-driver temperatures, fans (part fan, every fan_generic /
+    heater_fan / controller_fan / temperature_fan with speed %), output pins and LEDs, filament
+    runout sensors, plus Snapmaker/paxx extras (purifier, print_task_config, DragonBreath) under
+    "other". Read-only. Use it to answer "what is running and how hot is it"."""
+    from . import sensors
+    try:
+        async with _client() as c:
+            names = [n for n in await c.objects_list() if sensors.wanted(n)]
+            return sensors.summarize(await c.objects_query_named(names)) if names else {}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def query_objects(names: list[str]) -> dict:
+    """Raw Klipper object state for the named objects (as Moonraker's printer/objects/query returns
+    it), e.g. ["temperature_sensor cavity", "fan_generic exhaust"]. With names=[] it lists every
+    object the printer has. Read-only; for a readable summary use get_printer_sensors."""
+    try:
+        async with _client() as c:
+            if not names:
+                return {"objects": await c.objects_list()}
+            return {"status": await c.objects_query_named(names)}
+    except ApiError as e:
+        return _err(e)
+
+
+def _cfg_path_ok(path: str) -> str | None:
+    p = (path or "").replace("\\", "/").lstrip("/")
+    if not p or ".." in p.split("/") or not p.lower().endswith((".cfg", ".conf")):
+        return None
+    return p
+
+
+@mcp.tool()
+async def list_config_files() -> dict:
+    """List the printer's config files (Moonraker's "config" root: printer.cfg, moonraker.conf and,
+    on the U1's extended firmware, extended/klipper/*.cfg). Read-only."""
+    try:
+        async with _client() as c:
+            files = await c.config_files()
+        return {"files": sorted(f.get("path") for f in files
+                                if str(f.get("path", "")).lower().endswith((".cfg", ".conf")))}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def read_config_file(path: str) -> dict:
+    """Read one config file by its path from list_config_files (e.g. "extended/klipper/exhaust.cfg").
+    Read-only."""
+    p = _cfg_path_ok(path)
+    if p is None:
+        return {"error": "bad_path", "hint": "a .cfg/.conf path from list_config_files, no '..'"}
+    try:
+        async with _client() as c:
+            text = await c.config_read(p)
+        return {"path": p, "lines": text.count("\n") + 1, "text": text}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def write_config_file(path: str, text: str, confirm: bool = False) -> dict:
+    """Replace a config file's contents (.cfg/.conf under the config root). Before writing, the
+    current file is copied to <path>.bak-<timestamp> next to it. Nothing is reloaded: Klipper
+    reads config only on restart (on the U1, Grant hard-reboots after a .cfg change), and
+    moonraker.conf needs a Moonraker restart. TWO-PHASE: without confirm=true this returns a
+    unified diff preview and changes nothing; show it to the user, then call again with
+    confirm=true."""
+    import difflib, datetime
+    p = _cfg_path_ok(path)
+    if p is None:
+        return {"error": "bad_path", "hint": "a .cfg/.conf path, no '..'"}
+    try:
+        async with _client() as c:
+            try:
+                old = await c.config_read(p)
+                exists = True
+            except ApiError:
+                old, exists = "", False
+            diff = "".join(difflib.unified_diff(old.splitlines(True), text.splitlines(True),
+                                                f"a/{p}", f"b/{p}"))
+            if not confirm:
+                return gate.confirm_required("write_config_file", {"path": p, "exists": exists,
+                                                                   "diff": diff or "(no change)"})
+            if old == text:
+                return {"ok": True, "path": p, "changed": False}
+            backup = None
+            if exists:
+                backup = f"{p}.bak-{datetime.datetime.now():%Y%m%d-%H%M%S}"
+                await c.config_copy(p, backup)
+            await c.config_write(p, text)
+        return {"ok": True, "path": p, "changed": True, "backup": backup,
+                "note": "not reloaded; restart Klipper (U1: hard reboot) to apply"}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
 async def get_printer_info() -> dict:
     """Klipper host info: state and the full state message (e.g. why it is shut down and how to
     recover), Klipper version, hostname. Read-only."""
@@ -548,6 +651,11 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     # name: (title, read_only, destructive)
     "get_printer_status": ("Get live printer status", True, False),
     "get_printer_info": ("Get Klipper host info", True, False),
+    "get_printer_sensors": ("Get all sensors, fans and outputs", True, False),
+    "query_objects": ("Query raw Klipper objects", True, False),
+    "list_config_files": ("List printer config files", True, False),
+    "read_config_file": ("Read a printer config file", True, False),
+    "write_config_file": ("Write a printer config file (with backup)", False, True),
     "list_print_history": ("List print history", True, False),
     "list_gcode_files": ("List G-code files on printer", True, False),
     "get_console": ("Get recent console lines", True, False),
