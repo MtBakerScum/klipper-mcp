@@ -148,6 +148,26 @@ class MoonrakerClient:
     async def firmware_restart(self) -> str:
         return await self._request("POST", "/printer/firmware_restart")
 
+    async def history_job(self, uid: str) -> dict:
+        res = await self._request("GET", "/server/history/job", params={"uid": uid})
+        return (res or {}).get("job", {})
+
+    async def file_roots(self) -> list[dict]:
+        return await self._request("GET", "/server/files/roots") or []
+
+    async def download(self, root: str, path: str, timeout: float = 120.0) -> bytes:
+        from urllib.parse import quote
+        url = f"{self._base}/server/files/{root}/{quote(path)}"
+        try:
+            resp = await self._http.get(url, timeout=httpx.Timeout(timeout, connect=self._cfg.connect_timeout))
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            raise NotReachable(f"Moonraker not reachable at {self._base}: {e}") from e
+        except httpx.TransportError as e:
+            raise NoReply(f"no reply downloading {path}: {type(e).__name__}") from e
+        if resp.status_code >= 400:
+            raise error_from_status(resp.status_code, {})
+        return resp.content
+
     # --- config files (root "config") ---
     async def config_files(self) -> list[dict]:
         return await self._request("GET", "/server/files/list", params={"root": "config"}) or []

@@ -187,6 +187,137 @@ async def list_print_history(limit: int = 10) -> dict:
 
 
 @mcp.tool()
+async def get_job_filament(job_id: str | None = None) -> dict:
+    """Filament used PER HEAD by a finished or cancelled print job (default: the most recent one):
+    mm and grams per tool, from the job's G-code walked up to the amount the printer actually
+    extruded (so a cancelled job counts only what was printed). Use it to log spools. Grams need
+    the filament_diameter/density Orca writes into the G-code. Read-only; downloads the G-code."""
+    from .gcode_usage import per_tool_usage
+    try:
+        async with _client() as c:
+            if job_id:
+                job = await c.history_job(job_id)
+            else:
+                jobs = await c.history_list(limit=1)
+                job = jobs[0] if jobs else {}
+            if not job:
+                return {"error": "no_job", "hint": "no print history yet, or unknown job_id"}
+            fname = job.get("filename")
+            actual = job.get("filament_used")
+            data = await c.download("gcodes", fname)
+        usage = per_tool_usage(data.decode("utf-8", "replace").splitlines(),
+                               stop_at_mm=float(actual) if actual else None)
+        return {"job_id": job.get("job_id"), "filename": fname, "status": job.get("status"),
+                "actual_total_mm": round(float(actual), 1) if actual else None, **usage,
+                "note": "per-head split from the G-code; total matches the printer's own count"}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def list_timelapses(limit: int = 20) -> dict:
+    """Timelapse videos on the printer, newest first (any Moonraker file root holding .mp4/.mkv
+    files, e.g. "timelapse"). Read-only. Use save_timelapse to copy one to this PC."""
+    try:
+        async with _client() as c:
+            roots = [r.get("name") for r in await c.file_roots() if r.get("name")]
+            vids = []
+            for root in roots:
+                if root in ("config", "logs", "config_examples", "docs"):
+                    continue
+                try:
+                    files = await c.files_list(root)
+                except ApiError:
+                    continue
+                for f in files:
+                    if str(f.get("path", "")).lower().endswith((".mp4", ".mkv", ".avi")):
+                        vids.append({"root": root, "path": f.get("path"), "size": f.get("size"),
+                                     "modified": f.get("modified")})
+        vids.sort(key=lambda v: v.get("modified") or 0, reverse=True)
+        return {"count": len(vids[:limit]), "timelapses": vids[:max(1, limit)]}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def save_timelapse(path: str, root: str = "timelapse", frames: int = 0):
+    """Copy a timelapse from the printer (path/root from list_timelapses) to this PC and return
+    where it was saved. frames=N (max 8) also returns N evenly spaced stills to look at, when
+    ffmpeg is installed on this PC; otherwise just the file. Read-only on the printer."""
+    import os, shutil, subprocess, tempfile
+    from pathlib import Path as _P
+    try:
+        async with _client() as c:
+            data = await c.download(root, path, timeout=300.0)
+    except ApiError as e:
+        return _err(e)
+    out_dir = _P(os.environ.get("KLIPPER_MCP_DOWNLOADS", str(_P.home() / "Downloads" / "printer-timelapses")))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / _P(path).name
+    dest.write_bytes(data)
+    meta = {"saved": str(dest), "bytes": len(data)}
+    frames = max(0, min(int(frames), 8))
+    if frames == 0:
+        return meta
+    ff = shutil.which("ffmpeg")
+    probe = shutil.which("ffprobe")
+    if not ff or not probe:
+        return {**meta, "frames": "ffmpeg not found on this PC; only the file was saved"}
+    try:
+        dur = float(subprocess.run([probe, "-v", "error", "-show_entries", "format=duration", "-of",
+                                    "default=nw=1:nk=1", str(dest)], capture_output=True, text=True,
+                                   timeout=30).stdout.strip() or 0)
+    except (ValueError, subprocess.SubprocessError):
+        dur = 0
+    images = []
+    with tempfile.TemporaryDirectory() as td:
+        for i in range(frames):
+            t = dur * (i + 0.5) / frames if dur > 0 else i
+            fp = _P(td) / f"f{i}.jpg"
+            subprocess.run([ff, "-v", "error", "-ss", f"{t:.2f}", "-i", str(dest), "-frames:v", "1",
+                            "-vf", "scale=960:-2", str(fp)], capture_output=True, timeout=60)
+            if fp.exists():
+                images.append(Image(data=fp.read_bytes(), format="jpeg"))
+    return [*images, {**meta, "frames_returned": len(images), "duration_s": round(dur, 1)}]
+
+
+@mcp.tool()
+async def wait_for_height(z_mm: float, timeout_s: float = 600, snapshot: bool = True):
+    """Wait until the running print reaches height z_mm (toolhead Z, mm above the bed), then
+    return the status and, by default, a camera snapshot. Use it for checks at specific heights
+    (support tops, clip mounts) instead of guessing times. Returns early if the print ends,
+    pauses or errors, and after timeout_s (max 1200) with reached=false - call it again to keep
+    waiting. Read-only."""
+    import asyncio, time
+    timeout_s = max(5.0, min(float(timeout_s), 1200.0))
+    deadline = time.monotonic() + timeout_s
+    hits = 0
+    try:
+        async with _client() as c:
+            while True:
+                q = await c.objects_query(["toolhead", "print_stats", "display_status"])
+                z = ((q.get("toolhead") or {}).get("position") or [0, 0, 0])[2]
+                job = (q.get("print_stats") or {}).get("state")
+                prog = (q.get("display_status") or {}).get("progress")
+                # Two polls in a row, so a Z-hop or travel lift doesn't count as reaching it.
+                hits = hits + 1 if (z is not None and z >= z_mm) else 0
+                reached = hits >= 2
+                done = job not in ("printing",)
+                if reached or done or time.monotonic() >= deadline:
+                    info = {"reached": bool(reached), "z": round(z or 0, 2), "target_z": z_mm,
+                            "job_state": job, "progress_pct": round((prog or 0) * 100, 1)}
+                    break
+                await asyncio.sleep(5)
+    except ApiError as e:
+        return _err(e)
+    if snapshot and info["reached"]:
+        snap = await get_camera_snapshot()
+        if isinstance(snap, list):
+            return [snap[0], {**info, "camera": snap[1].get("camera")}]
+    return info
+
+
+@mcp.tool()
 async def list_gcode_files(limit: int = 50) -> dict:
     """G-code files staged on the printer (Moonraker 'gcodes' root), newest first. Read-only."""
     try:
@@ -654,6 +785,10 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "get_printer_sensors": ("Get all sensors, fans and outputs", True, False),
     "query_objects": ("Query raw Klipper objects", True, False),
     "list_config_files": ("List printer config files", True, False),
+    "get_job_filament": ("Filament used per head by a job", True, False),
+    "list_timelapses": ("List timelapse videos", True, False),
+    "save_timelapse": ("Save a timelapse to this PC", True, False),
+    "wait_for_height": ("Wait for the print to reach a height", True, False),
     "read_config_file": ("Read a printer config file", True, False),
     "write_config_file": ("Write a printer config file (with backup)", False, True),
     "list_print_history": ("List print history", True, False),
