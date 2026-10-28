@@ -169,3 +169,15 @@ async def test_upload_reads_the_file_off_the_event_loop(tmp_path, monkeypatch):
     assert out["item"]["path"] == "big.gcode"
     assert calls, "file read must be handed to a worker thread, not done on the loop"
     assert b"G1 X0\n" * 10_000 in route.calls.last.request.content
+
+
+@respx.mock
+async def test_read_timeout_is_not_retried_on_fallback():
+    # A long macro: sent, but no reply before the timeout. Must not be resent on the fallback URL.
+    primary = respx.post(url__regex=rf"{B}/printer/gcode/script.*").mock(side_effect=httpx.ReadTimeout("slow"))
+    fb = respx.post(url__regex=rf"{FB}/printer/gcode/script.*").mock(return_value=httpx.Response(200, json={"result": "ok"}))
+    from klipper_mcp.errors import NoReply
+    async with MoonrakerClient(_cfg(FB)) as c:
+        with pytest.raises(NoReply):
+            await c.gcode_script("G28")
+    assert primary.call_count == 1 and fb.call_count == 0

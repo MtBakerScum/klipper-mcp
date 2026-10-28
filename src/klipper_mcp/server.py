@@ -6,7 +6,7 @@ from mcp.server.mcpserver import MCPServer, Image
 from mcp.types import ToolAnnotations
 from .config import load_config
 from .client import MoonrakerClient
-from .errors import ApiError, Refused, PrinterNotReady
+from .errors import ApiError, NoReply, Refused, PrinterNotReady
 from . import gate
 from . import outcomes
 from .status import summarize_status, STATUS_OBJECTS
@@ -345,13 +345,18 @@ async def tune_live(pressure_advance: float | None = None, z_offset: float | Non
 
 
 @mcp.tool()
-async def send_gcode(script: str, confirm: bool = False) -> dict:
+async def send_gcode(script: str, confirm: bool = False, wait: bool = True) -> dict:
     """Send raw G-code / a Klipper macro, VERBATIM: no rewriting. Multiple lines are allowed and all
     execute under the single confirmation. The numeric ceilings enforced by set_temperature/tune_live
     do NOT apply on this path; the preview shows the exact bytes that will be sent, so review it
     carefully. The general actuator behind the specific tools; prefer those. Refused unless Klipper
     is ready. TWO-PHASE: without confirm=true this returns a preview and changes nothing; ask the
-    user, then call again with confirm=true."""
+    user, then call again with confirm=true.
+    Sent ONCE, never retried. wait=true (default) waits for Klipper to finish (up to the server's
+    request timeout); wait=false returns as soon as the command is accepted - use it for long
+    macros (homing, offset/probe calibrations, bed mesh) and follow with wait_until_idle.
+    status "running" / "sent_no_reply" means the command WAS sent and may still be running:
+    do NOT send it again; check wait_until_idle / get_console instead."""
     try:
         script = script.strip()
         if not script:
@@ -359,10 +364,50 @@ async def send_gcode(script: str, confirm: bool = False) -> dict:
         async with _client() as c:
             _, st = await _ready_and_status(c)
             if not confirm:
-                return gate.confirm_required("send_gcode", {"gcode": script, **_job_preview(st)})
-            await c.gcode_script(script)
-        return {"ok": True, "action": "send_gcode", "sent": script}
+                return gate.confirm_required("send_gcode", {"gcode": script, "wait": wait, **_job_preview(st)})
+            try:
+                await c.gcode_script(script, reply_timeout=None if wait else 2.0)
+            except NoReply:
+                if not wait:
+                    return {"ok": True, "action": "send_gcode", "sent": script, "status": "running",
+                            "hint": "sent once and running; poll wait_until_idle, do not resend"}
+                return {"ok": False, "action": "send_gcode", "sent": script, "status": "sent_no_reply",
+                        "hint": "sent once; no reply before the timeout, so it is probably still running. "
+                                "Do NOT resend; use wait_until_idle or get_console."}
+        return {"ok": True, "action": "send_gcode", "sent": script, "status": "done"}
     except (PrinterNotReady, ApiError) as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def wait_until_idle(timeout_s: float = 120, poll_s: float = 2) -> dict:
+    """Wait until Klipper has finished the command or macro it is running (e.g. after
+    send_gcode(wait=false) for homing or a calibration). Read-only. Returns idle=true when Klipper's
+    idle_timeout leaves "Printing" (or a print job is running/paused, which counts as done with the
+    command queue), or idle=false after timeout_s (max 600) - then call it again rather than resending
+    the command. Also returns the last console lines so errors are visible."""
+    import asyncio, time
+    timeout_s = max(1.0, min(float(timeout_s), 600.0))
+    poll_s = max(0.5, min(float(poll_s), 30.0))
+    deadline = time.monotonic() + timeout_s
+    try:
+        async with _client() as c:
+            while True:
+                q = await c.objects_query(["idle_timeout", "print_stats", "webhooks"])
+                idle_state = (q.get("idle_timeout") or {}).get("state")
+                job = (q.get("print_stats") or {}).get("state")
+                klippy = (q.get("webhooks") or {}).get("state")
+                busy = idle_state == "Printing" and job not in ("printing", "paused")
+                if not busy or klippy not in (None, "ready") or time.monotonic() >= deadline:
+                    tail = []
+                    try:
+                        tail = [g.get("message") for g in (await c.gcode_store(10)) if g.get("message")]
+                    except ApiError:
+                        pass
+                    return {"idle": not busy, "idle_timeout_state": idle_state, "job_state": job,
+                            "klippy_state": klippy, "console_tail": tail}
+                await asyncio.sleep(poll_s)
+    except ApiError as e:
         return _err(e)
 
 
@@ -408,6 +453,28 @@ async def _apply_print_preferences(c, bed_level: bool, flow_calibrate: bool, tim
         return False
 
 
+async def _start_and_confirm(c, filename: str) -> dict:
+    """POST print/start once. On a lost reply, read print_stats to report what actually happened."""
+    import asyncio
+    try:
+        await c.print_start(filename)
+        return {"state": "started"}
+    except NoReply:
+        for _ in range(5):
+            await asyncio.sleep(2)
+            try:
+                ps = (await c.objects_query(["print_stats"])).get("print_stats") or {}
+            except ApiError:
+                continue
+            if ps.get("state") in ("printing", "paused") and Path(ps.get("filename") or "").name == Path(filename).name:
+                return {"state": "started", "note": "no reply to the start request, but the printer is printing it"}
+        return {"error": "start_unconfirmed",
+                "detail": "start request sent but no reply and the printer is not (yet) printing this "
+                          "file; check get_printer_status before trying again"}
+    except ApiError as e:
+        return {"error": str(e)}
+
+
 @mcp.tool()
 async def start_print(path: str, confirm: bool = False, bed_level: bool = True,
                       flow_calibrate: bool = False, timelapse: bool = False) -> dict:
@@ -449,13 +516,20 @@ async def start_print(path: str, confirm: bool = False, bed_level: bool = True,
                 return gate.confirm_required("start_print", preview)
             prefs_applied = await _apply_print_preferences(c, bed_level, flow_calibrate, timelapse)
             if is_local:
-                await c.upload_gcode(str(local), filename)
                 try:
-                    await c.print_start(filename)
-                except ApiError as e:
-                    return {"error": str(e), "uploaded": True, "filename": filename}
-            else:
-                await c.print_start(filename)
+                    await c.upload_gcode(str(local), filename)
+                except NoReply:
+                    # The upload went out but the reply didn't come back: check what is really there
+                    # before calling it a failure, and never upload twice.
+                    meta = await c.file_metadata(filename)
+                    size = local.stat().st_size
+                    if not meta or (meta.get("size") not in (None, size)):
+                        return {"error": "upload_unconfirmed", "filename": filename,
+                                "detail": "upload sent but no reply, and the file on the printer is "
+                                          "missing or a different size; check list_gcode_files"}
+            started = await _start_and_confirm(c, filename)
+            if "error" in started:
+                return {**started, "uploaded": is_local, "filename": filename}
         return {"ok": True, "action": "start_print", "filename": filename, "uploaded": is_local,
                 "overwrites_existing": overwrites_existing, "print_preferences_applied": prefs_applied}
     except (PrinterNotReady, ApiError) as e:
@@ -486,6 +560,7 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "cancel_print": ("Cancel print", False, True),
     "tune_live": ("Live-tune PA / Z / flow / fan", False, True),
     "send_gcode": ("Send raw G-code", False, True),
+    "wait_until_idle": ("Wait until Klipper is idle", True, False),
     "firmware_restart": ("Firmware restart", False, True),
     "emergency_stop": ("Emergency stop", False, True),
     "start_print": ("Start print (upload + start)", False, True),

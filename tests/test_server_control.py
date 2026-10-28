@@ -152,3 +152,21 @@ async def test_set_temperature_accepts_toolchanger_extruders(monkeypatch):
     assert not script.called
     out = await srv.set_temperature("extruder2", 320, confirm=True)
     assert "refused" in out["error"] and not script.called
+
+
+@respx.mock
+async def test_send_gcode_timeout_is_reported_as_running_not_resent(monkeypatch):
+    _env(monkeypatch); _mock_reads()
+    script = respx.post(url__regex=rf"{B}/printer/gcode/script.*").mock(side_effect=httpx.ReadTimeout("slow"))
+    out = await srv.send_gcode("XYZ_OFFSET_CALIBRATE_ALL", confirm=True)
+    assert out["status"] == "sent_no_reply" and "Do NOT resend" in out["hint"]
+    assert script.call_count == 1
+
+
+@respx.mock
+async def test_send_gcode_wait_false_returns_running(monkeypatch):
+    _env(monkeypatch); _mock_reads()
+    script = respx.post(url__regex=rf"{B}/printer/gcode/script.*").mock(side_effect=httpx.ReadTimeout("slow"))
+    out = await srv.send_gcode("G28", confirm=True, wait=False)
+    assert out["ok"] is True and out["status"] == "running"
+    assert script.call_count == 1

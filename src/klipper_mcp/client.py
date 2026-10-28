@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 import httpx
 from .config import Config
-from .errors import NotReachable, error_from_status
+from .errors import ApiError, NoReply, NotReachable, error_from_status
 
 
 # Process-wide memory of which URL last answered, keyed by the configured primary URL.
@@ -42,10 +42,11 @@ class MoonrakerClient:
                 return u
         return None
 
-    async def _request(self, method: str, path: str, *, params=None, files=None, data=None):
+    async def _request(self, method: str, path: str, *, params=None, files=None, data=None, timeout=None):
+        kw = {} if timeout is None else {"timeout": timeout}
         try:
-            resp = await self._http.request(method, self._base + path, params=params, files=files, data=data)
-        except httpx.TransportError as e:
+            resp = await self._http.request(method, self._base + path, params=params, files=files, data=data, **kw)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             # mDNS can fail while the wired IP still answers (or the reverse): try each configured
             # URL once per client, remember the one that answers, forget it if nothing does.
             nxt = self._next_base()
@@ -53,7 +54,14 @@ class MoonrakerClient:
                 _LEARNED.pop(self._cfg.base_url, None)
                 raise NotReachable(f"Moonraker not reachable at {self._base}: {e}") from e
             self._base = nxt
-            return await self._request(method, path, params=params, files=files, data=data)
+            return await self._request(method, path, params=params, files=files, data=data, timeout=timeout)
+        except httpx.TransportError as e:
+            # Connected and sent, but the reply never came (read timeout, dropped connection).
+            # The printer may be running the request right now: never retry it, on this URL or
+            # the fallback, or a long macro runs twice.
+            _LEARNED[self._cfg.base_url] = self._base
+            raise NoReply(f"sent to Moonraker at {self._base}, but no reply ({type(e).__name__}); "
+                          f"it may still be running - check before resending") from e
         _LEARNED[self._cfg.base_url] = self._base
         try:
             body = resp.json()
@@ -109,8 +117,19 @@ class MoonrakerClient:
     async def print_cancel(self) -> str:
         return await self._request("POST", "/printer/print/cancel")
 
-    async def gcode_script(self, script: str) -> str:
-        return await self._request("POST", "/printer/gcode/script", params={"script": script})
+    async def gcode_script(self, script: str, reply_timeout: float | None = None) -> str:
+        """Moonraker answers only when the script has finished. reply_timeout overrides the read
+        timeout for this call (connect timeout unchanged); a NoReply means it was sent."""
+        t = None
+        if reply_timeout is not None:
+            t = httpx.Timeout(reply_timeout, connect=self._cfg.connect_timeout)
+        return await self._request("POST", "/printer/gcode/script", params={"script": script}, timeout=t)
+
+    async def file_metadata(self, filename: str) -> dict | None:
+        try:
+            return await self._request("GET", "/server/files/metadata", params={"filename": filename})
+        except ApiError:
+            return None
 
     async def emergency_stop(self) -> str:
         return await self._request("POST", "/printer/emergency_stop")

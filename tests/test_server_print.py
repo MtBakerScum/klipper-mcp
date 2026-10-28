@@ -156,3 +156,25 @@ async def test_start_print_still_starts_when_preferences_unknown(monkeypatch):
     start = respx.post(url__regex=rf"{B}/printer/print/start.*").mock(return_value=httpx.Response(200, json={"result": "ok"}))
     out = await srv.start_print("onpi.gcode", confirm=True, bed_level=False)
     assert out["ok"] and out["print_preferences_applied"] is False and start.called
+
+
+@respx.mock
+async def test_start_print_lost_reply_but_printing_is_reported_started(monkeypatch, tmp_path):
+    import klipper_mcp.server as srv
+    from tests.test_server_control import _env, B, READY
+    _env(monkeypatch)
+    respx.get(f"{B}/printer/info").mock(return_value=httpx.Response(200, json=READY))
+    idle = {"result": {"status": {"webhooks": {"state": "ready"}, "extruder": {"temperature": 25.0, "target": 0.0},
+                                  "heater_bed": {"temperature": 24.0, "target": 0.0},
+                                  "print_stats": {"state": "standby", "filename": ""}, "display_status": {"progress": 0}}}}
+    printing = {"result": {"status": {"print_stats": {"state": "printing", "filename": "p.gcode"}}}}
+    respx.get(url__regex=rf"{B}/printer/objects/query.*").mock(side_effect=[httpx.Response(200, json=idle),
+                                                                             httpx.Response(200, json=printing)])
+    respx.get(url__regex=rf"{B}/server/files/list.*").mock(return_value=httpx.Response(200, json={"result": [{"path": "p.gcode"}]}))
+    respx.post(url__regex=rf"{B}/printer/gcode/script.*").mock(return_value=httpx.Response(200, json={"result": "ok"}))
+    start = respx.post(url__regex=rf"{B}/printer/print/start.*").mock(side_effect=httpx.ReadTimeout("slow"))
+    import asyncio
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
+    out = await srv.start_print("p.gcode", confirm=True)
+    assert out.get("ok") is True and start.call_count == 1

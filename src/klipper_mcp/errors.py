@@ -9,6 +9,11 @@ class NotReachable(ApiError):
     pass
 
 
+class NoReply(ApiError):
+    """The request reached Moonraker (it was sent) but no reply came back in time. The command may
+    still be running, or may already have finished; it must NOT be resent blindly."""
+
+
 class BadRequest(ApiError):
     pass
 
