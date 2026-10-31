@@ -9,6 +9,7 @@ from .client import MoonrakerClient
 from .errors import ApiError, NoReply, Refused, PrinterNotReady
 from . import gate
 from . import outcomes
+from . import runout
 from .status import summarize_status, STATUS_OBJECTS
 
 try:
@@ -486,6 +487,62 @@ def _job_preview(st: dict) -> dict:
             "progress_percent": st["job"]["progress_percent"]}
 
 
+def _local_gcode_tools(path: Path) -> list[int] | None:
+    """Logical tools a local G-code file extrudes with (tracker #50)."""
+    from .gcode_usage import per_tool_usage
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            usage = per_tool_usage(fh)
+    except OSError:
+        return None
+    return [r["tool"] for r in usage["tools"] if r["mm"] > 1.0] or None
+
+
+async def _runout_state(c, filename: str | None = None, tools: list[int] | None = None) -> dict:
+    """Tracker #50: which used heads have a runout backup the U1 would switch to."""
+    names = await c.objects_list()
+    if "print_task_config" not in names:
+        return {"supported": False}
+    feeds_n = [n for n in names if n.startswith("filament_feed")]
+    want = ["print_task_config"] + [n for n in names if n in {runout.extruder_obj(i) for i in range(runout.HEADS)}
+                                    or n in {runout.sensor_obj(i) for i in range(runout.HEADS)}] + feeds_n
+    q = await c.objects_query_named(want)
+    ptc = q.get("print_task_config") or {}
+    feeds: dict = {}
+    for n in feeds_n:
+        feeds.update(q.get(n) or {})
+    sensors = {k: v for k, v in q.items() if k.startswith("filament_motion_sensor")}
+    extruders = {k: v for k, v in q.items() if k == "extruder" or (k.startswith("extruder") and k[8:].isdigit())}
+    if not tools and filename:
+        meta = await c.file_metadata(filename) or {}
+        rt = meta.get("referenced_tools")
+        if isinstance(rt, list) and rt:
+            tools = [int(t) for t in rt if isinstance(t, (int, float))]
+    heads = runout.used_heads(ptc, tools)
+    rep = runout.report(ptc, feeds, sensors, extruders, heads)
+    rep["used_heads_from"] = "file" if tools else "printer"
+    rep["empty_used_heads"] = [h["head"] for h in rep["heads"] if not h["loaded"]]
+    return {"supported": True, **rep}
+
+
+@mcp.tool()
+async def check_runout_backups(path: str | None = None) -> dict:
+    """Snapmaker U1: for each head a job uses, whether the printer has a backup head it would switch
+    to automatically when that head runs out (same filament vendor/type/sub-type, same colour
+    unless the printer's ignore-colour option is on, same nozzle size and flow type, filament
+    loaded). A head with no backup pauses the print on runout, the extruder map can't be changed
+    while paused, and resuming needs filament loaded into that same head.
+    path: a G-code file (local, or on the printer) to take the used heads from; otherwise the current or last
+    job's heads (or every head with filament set). Read-only."""
+    try:
+        async with _client() as c:
+            if path and Path(path).is_file():
+                return await _runout_state(c, None, _local_gcode_tools(Path(path)))
+            return await _runout_state(c, path or None)
+    except ApiError as e:
+        return _err(e)
+
+
 @mcp.tool()
 async def set_temperature(heater: str, target: float, confirm: bool = False) -> dict:
     """Set a heater target. heater: 'extruder' (tool 1), 'extruder1'..'extruder3' (tools 2-4 on a
@@ -519,7 +576,19 @@ async def _job_control(action: str, confirm: bool) -> dict:
         async with _client() as c:
             _, st = await _ready_and_status(c)
             if not confirm:
-                return gate.confirm_required(action, _job_preview(st))
+                preview = _job_preview(st)
+                if action == "resume_print" and st["job"]["state"] == "paused":
+                    # Tracker #50: after a runout with no backup, RESUME keeps failing until the
+                    # empty head is loaded; say which one before trying.
+                    try:
+                        ro = await _runout_state(c)
+                        if ro.get("supported") and ro.get("empty_used_heads"):
+                            preview["resume_needs_filament_in_heads"] = ro["empty_used_heads"]
+                            preview["note"] = ("a head this job uses has no filament; load it first "
+                                               "or RESUME fails with a filament runout error")
+                    except Exception:  # best effort
+                        pass
+                return gate.confirm_required(action, preview)
             await getattr(c, _JOB_METHODS[action])()
         return {"ok": True, "action": action, "was": _job_preview(st)}
     except (PrinterNotReady, ApiError) as e:
@@ -746,6 +815,13 @@ async def start_print(path: str, confirm: bool = False, bed_level: bool = True,
                        "klippy_state": st["klippy"]["state"], "job_state": st["job"]["state"],
                        "print_preferences": {"bed_level": bed_level, "flow_calibrate": flow_calibrate,
                                              "timelapse": timelapse}}
+            try:
+                ro = await _runout_state(c, None if is_local else filename,
+                                         _local_gcode_tools(local) if is_local else None)
+                if ro.get("supported"):
+                    preview["runout_backups"] = {"heads": ro["heads"], "warnings": ro["warnings"]}
+            except Exception:  # best effort: never block a start on this
+                pass
             if not confirm:
                 return gate.confirm_required("start_print", preview)
             prefs_applied = await _apply_print_preferences(c, bed_level, flow_calibrate, timelapse)
@@ -793,6 +869,7 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "write_config_file": ("Write a printer config file (with backup)", False, True),
     "list_print_history": ("List print history", True, False),
     "list_gcode_files": ("List G-code files on printer", True, False),
+    "check_runout_backups": ("Check runout backup heads", True, False),
     "get_console": ("Get recent console lines", True, False),
     "get_power_devices": ("Get power device states", True, False),
     "get_bed_mesh": ("Get bed mesh", True, False),
