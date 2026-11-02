@@ -10,6 +10,7 @@ from .errors import ApiError, NoReply, Refused, PrinterNotReady
 from . import gate
 from . import outcomes
 from . import runout
+from . import offsets
 from .status import summarize_status, STATUS_OBJECTS
 
 try:
@@ -544,6 +545,82 @@ async def check_runout_backups(path: str | None = None) -> dict:
 
 
 @mcp.tool()
+async def get_head_offsets() -> dict:
+    """Snapmaker U1: each head's XYZ offset from head 1 (what the offset calibration measured and
+    the printer applies at every tool change), with nozzle size/type, plus the printer's main
+    state and calibration step (to see whether a calibration is running). Read-only."""
+    try:
+        async with _client() as c:
+            q = await c.objects_query_named(offsets.QUERY)
+        if "extruder_offset_calibration" not in q:
+            return {"supported": False, "reason": "no extruder_offset_calibration object (not a Snapmaker U1?)"}
+        return {"supported": True, **offsets.summarize(q)}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def calibrate_head_offsets(phase: str, confirm: bool = False, heads: list[int] | None = None,
+                                 clean: bool = True, bed_temp: int | None = None) -> dict:
+    """Snapmaker U1: run the head offset (XYZ) calibration without the touchscreen, in the
+    firmware's own order. Three phases, each two-phase (preview, then confirm=true):
+    - "start": enters the calibration state (only from idle), heats the bed (55 C unless bed_temp)
+      and nozzles, homes, then for each head heats, wipes on the cleaner (clean=true) and cools to
+      140 C. Takes several minutes; returns at once: follow with wait_until_idle.
+    - "probe": after start has finished AND the build plate has been REMOVED (the probe touches the
+      bed's reference point; the firmware checks the plate is off), probes each head, saves the
+      offsets and leaves the calibration state. Follow with wait_until_idle, then get_head_offsets.
+    - "exit": leave the calibration state and turn heaters off (after an error or to cancel).
+    heads: which heads (1-4, default all); probing a subset saves just those. Do not resend a
+    phase while it runs; check wait_until_idle / get_console instead."""
+    if phase not in ("start", "probe", "exit"):
+        return {"error": "phase must be start, probe or exit"}
+    hs = offsets.parse_heads(heads)
+    if isinstance(hs, str):
+        return {"error": hs}
+    try:
+        async with _client() as c:
+            _, st = await _ready_and_status(c)
+            q = await c.objects_query_named(offsets.QUERY)
+            if "extruder_offset_calibration" not in q:
+                return {"error": "not_supported", "reason": "no extruder_offset_calibration object (not a Snapmaker U1?)"}
+            state = offsets.summarize(q)
+            ms = state["main_state"]
+            if phase == "start":
+                if ms != "IDLE" or st["job"]["state"] in ("printing", "paused"):
+                    return {"error": "not_idle", "main_state": ms, "job_state": st["job"]["state"],
+                            "reason": "the calibration can only start from idle; finish or cancel the print "
+                                      "(or calibrate_head_offsets(phase='exit') if a calibration is stuck)"}
+                script = offsets.start_script(hs, clean, bed_temp)
+                note = ("next: wait_until_idle (several minutes), then take the build plate OFF, then "
+                        "calibrate_head_offsets(phase='probe')")
+            elif phase == "probe":
+                if ms != "XYZ_OFFSET_CALIBRATE":
+                    return {"error": "not_started", "main_state": ms,
+                            "reason": "run calibrate_head_offsets(phase='start') first and wait for it to finish"}
+                script = offsets.probe_script(hs)
+                note = "the build plate must be OFF. Next: wait_until_idle, then get_head_offsets; put the plate back"
+            else:
+                script = ("EXTRUDER_OFFSET_ACTION_EXIT" if ms == "XYZ_OFFSET_CALIBRATE"
+                          else "TURN_OFF_HEATERS")
+                note = "leaves the calibration state; heaters off"
+            preview = {"phase": phase, "heads": hs, "gcode": script, "main_state": ms,
+                       "current_offsets": state["heads"], "note": note}
+            if not confirm:
+                return gate.confirm_required("calibrate_head_offsets", preview)
+            try:
+                await c.gcode_script(script, reply_timeout=2.0)
+                status = "done"
+            except NoReply:
+                status = "running"
+        return {"ok": True, "action": "calibrate_head_offsets", "phase": phase, "status": status,
+                "sent": script, "next": note,
+                "hint": "sent once; poll wait_until_idle (and get_console for errors), do not resend"}
+    except (PrinterNotReady, ApiError) as e:
+        return _err(e)
+
+
+@mcp.tool()
 async def set_temperature(heater: str, target: float, confirm: bool = False) -> dict:
     """Set a heater target. heater: 'extruder' (tool 1), 'extruder1'..'extruder3' (tools 2-4 on a
     toolchanger), or 'bed'. Hard ceilings: any extruder 300C, bed 110C.
@@ -870,6 +947,8 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "list_print_history": ("List print history", True, False),
     "list_gcode_files": ("List G-code files on printer", True, False),
     "check_runout_backups": ("Check runout backup heads", True, False),
+    "get_head_offsets": ("Get per-head XYZ offsets", True, False),
+    "calibrate_head_offsets": ("Run the head offset calibration", False, True),
     "get_console": ("Get recent console lines", True, False),
     "get_power_devices": ("Get power device states", True, False),
     "get_bed_mesh": ("Get bed mesh", True, False),
