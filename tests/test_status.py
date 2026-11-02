@@ -60,3 +60,17 @@ def test_toolchanger_reports_every_tool_and_the_active_one():
 def test_status_objects_include_all_toolchanger_extruders():
     for n in ("extruder", "extruder1", "extruder2", "extruder3"):
         assert n in STATUS_OBJECTS
+
+
+def test_z_offset_is_homing_origin_z_and_head_offsets_shown():
+    # tracker #56: on a U1 the G-code offset holds the head's XY offset after a tool pick; z_offset
+    # must be its Z (index 2), not X or Y.
+    from klipper_mcp.status import summarize_status
+    st = {"toolhead": {"extruder": "extruder1"},
+          "gcode_move": {"homing_origin": [0.0169, 0.0416, 0.0, 0.0]},
+          "extruder1": {"extruder_offset": [-0.0868, -0.0601, -0.023]}}
+    out = summarize_status(st)
+    assert out["z_offset"] == 0.0
+    assert out["gcode_offset"] == {"x": 0.0169, "y": 0.0416, "z": 0.0}
+    assert out["active_head_offset"]["z"] == -0.023
+    assert out["plate_z_adjust"] == 0.023

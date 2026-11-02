@@ -23,6 +23,13 @@ def _extruder_temps(status: dict) -> dict:
     return out
 
 
+def _head_offset(ex: dict) -> dict | None:
+    off = ex.get("extruder_offset")
+    if not isinstance(off, list) or len(off) < 3:
+        return None
+    return {"x": _r(off[0], 4), "y": _r(off[1], 4), "z": _r(off[2], 4)}
+
+
 def summarize_status(status: dict) -> dict:
     wh = status.get("webhooks") or {}
     th0 = status.get("toolhead") or {}
@@ -57,7 +64,16 @@ def summarize_status(status: dict) -> dict:
             for name in EXTRUDER_OBJECTS if status.get(name)},
         "fan_percent": None if fan.get("speed") is None else int(round(float(fan["speed"]) * 100)),
         "pressure_advance": ex.get("pressure_advance"),
-        "z_offset": _r(origin[2], 3) if len(origin) > 2 else None,
+        # Klipper's G-code offset (gcode_move.homing_origin). On a U1 every tool pick sets it to
+        # that head's extruder_offset (Z included), so a manual Z adjust only lasts until the
+        # next pick (tracker #56). z_offset is its Z; plate_z_adjust is what is on top of the
+        # active head's own Z offset.
+        "z_offset": _r(origin[2], 4) if len(origin) > 2 else None,
+        "gcode_offset": ({"x": _r(origin[0], 4), "y": _r(origin[1], 4), "z": _r(origin[2], 4)}
+                         if len(origin) > 2 else None),
+        "active_head_offset": _head_offset(ex),
+        "plate_z_adjust": (_r(float(origin[2]) - (ex.get("extruder_offset") or [0, 0, 0])[2], 4)
+                           if len(origin) > 2 and ex.get("extruder_offset") is not None else None),
         "speed_factor": gm.get("speed_factor"),
         "flow_factor": gm.get("extrude_factor"),
         "position": [round(float(v), 2) for v in pos[:3]],
